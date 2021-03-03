@@ -28,7 +28,7 @@
 #include <linux/if_pppox.h>
 #include <linux/ppp_defs.h>
 #endif
-#ifdef CONFIG_NET_RALINK_OFFLOAD
+#if defined(CONFIG_NET_RALINK_OFFLOAD) || defined(CONFIG_NET_MEDIATEK_SOC)
 #include <net/netfilter/nf_flow_table.h>
 #endif
 #include "natflow_common.h"
@@ -68,7 +68,7 @@ void natflow_update_magic(int init)
 #ifdef CONFIG_NETFILTER_INGRESS
 static natflow_fastnat_node_t *natflow_fast_nat_table = NULL;
 
-#ifdef CONFIG_NET_RALINK_OFFLOAD
+#if defined(CONFIG_NET_RALINK_OFFLOAD) || defined(CONFIG_NET_MEDIATEK_SOC)
 struct natflow_offload {
 	struct flow_offload flow;
 };
@@ -105,7 +105,7 @@ static void natflow_offload_keepalive(unsigned int hash)
 		struct nf_conntrack_tuple_hash *h;
 
 		nfn->jiffies = current_jiffies;
-		NATFLOW_INFO("do keep alive[%u]: %pI4:%u->%pI4:%u\n", hash, &nfn->saddr, ntohs(nfn->source), &nfn->daddr, ntohs(nfn->dest));
+		NATFLOW_INFO("do keep alive[%u]: %pI4:%u->%pI4:%u update jiffies=%u\n", hash, &nfn->saddr, ntohs(nfn->source), &nfn->daddr, ntohs(nfn->dest), (int)nfn->jiffies);
 
 		memset(&tuple, 0, sizeof(tuple));
 		tuple.src.u3.ip = nfn->saddr;
@@ -130,7 +130,7 @@ static void natflow_offload_keepalive(unsigned int hash)
 
 			if (d == IP_CT_DIR_ORIGINAL) {
 				natflow_update_ct_timeout(ct, diff_jiffies);
-				NATFLOW_INFO("do keep alive update ct: %pI4:%u->%pI4:%u diff_jiffies=%u HZ=%u\n",
+				NATFLOW_INFO("do keep alive update ct0: %pI4:%u->%pI4:%u diff_jiffies=%u HZ=%u\n",
 				             &nfn->saddr, ntohs(nfn->source), &nfn->daddr, ntohs(nfn->dest), (int)diff_jiffies, HZ);
 			}
 
@@ -147,12 +147,12 @@ static void natflow_offload_keepalive(unsigned int hash)
 			        nfn->saddr == saddr && nfn->daddr == daddr && nfn->source == source && nfn->dest == dest && nfn->protonum == protonum) {
 				if (d == IP_CT_DIR_REPLY) {
 					natflow_update_ct_timeout(ct, diff_jiffies);
-					NATFLOW_INFO("do keep alive update ct: %pI4:%u->%pI4:%u diff_jiffies=%u HZ=%u\n",
+					NATFLOW_INFO("do keep alive update ct1: %pI4:%u->%pI4:%u diff_jiffies=%u HZ=%u\n",
 					             &nfn->saddr, ntohs(nfn->source), &nfn->daddr, ntohs(nfn->dest), (int)diff_jiffies, HZ);
 				}
 
 				nfn->jiffies = current_jiffies;
-				NATFLOW_INFO("do keep alive[%u]: %pI4:%u->%pI4:%u\n", hash, &nfn->saddr, ntohs(nfn->source), &nfn->daddr, ntohs(nfn->dest));
+				NATFLOW_INFO("do keep alive[%u]: %pI4:%u->%pI4:%u update jiffies=%u\n", hash, &nfn->saddr, ntohs(nfn->source), &nfn->daddr, ntohs(nfn->dest), (int)nfn->jiffies);
 			}
 			nf_ct_put(ct);
 			return;
@@ -352,6 +352,34 @@ static unsigned int natflow_path_pre_ct_in_hook(void *priv,
 		u32 _I;
 		natflow_fastnat_node_t *nfn;
 
+#if defined(CONFIG_NET_RALINK_OFFLOAD) || defined(CONFIG_NET_MEDIATEK_SOC)
+		/* XXX: check MTK_CPU_REASON_HIT_BIND_FORCE_CPU
+		 * nated-skb come to cpu from ppe, we just forward to ext dev(Wi-Fi)
+		 * skb->hash stored the hash key
+		 */
+		if (hwnat && skb->dev->netdev_ops->ndo_flow_offload &&
+		        (skb->vlan_tci & HWNAT_QUEUE_MAPPING_MAGIC_MASK) == HWNAT_QUEUE_MAPPING_MAGIC &&
+		        (skb->hash & HWNAT_QUEUE_MAPPING_MAGIC_MASK) == HWNAT_QUEUE_MAPPING_MAGIC) {
+			_I = (skb->hash & HWNAT_QUEUE_MAPPING_HASH_MASK) % (NATFLOW_FASTNAT_TABLE_SIZE * 2);
+			nfn = &natflow_fast_nat_table[_I];
+			_I = (u32)ulongmindiff(jiffies, nfn->jiffies);
+
+			if (nfn->outdev && _I <= NATFLOW_FF_TIMEOUT_LOW && nfn->magic == natflow_path_magic) {
+				//nfn->jiffies = jiffies; /* we update jiffies in keepalive */
+				__vlan_hwaccel_clear_tag(skb);
+				skb_push(skb, (void *)ip_hdr(skb) - (void *)eth_hdr(skb));
+				skb->dev = nfn->outdev;
+				dev_queue_xmit(skb);
+				return NF_STOLEN;
+			}
+			/* Strict conditions can determine that it is a specially marked skb
+			 * so it is safe to drop
+			 * TODO: del foe
+			 */
+			return NF_DROP;
+		}
+#endif
+
 		if (skb->mac_len != ETH_HLEN) {
 			return NF_ACCEPT;
 		}
@@ -402,35 +430,6 @@ static unsigned int natflow_path_pre_ct_in_hook(void *priv,
 		skb->protocol = __constant_htons(ETH_P_IP);
 		skb->transport_header = skb->network_header + ip_hdr(skb)->ihl * 4;
 
-#ifdef CONFIG_NET_RALINK_OFFLOAD
-		/* XXX: check MTK_CPU_REASON_HIT_BIND_FORCE_CPU
-		 * nated-skb come to cpu from ppe, we just forward to ext dev(Wi-Fi)
-		 * skb->queue_mapping stored the hash key
-		 */
-		if (hwnat && skb->dev->netdev_ops->ndo_flow_offload &&
-		        (skb->vlan_tci & HWNAT_QUEUE_MAPPING_MAGIC_MASK) == HWNAT_QUEUE_MAPPING_MAGIC &&
-		        (skb->queue_mapping & HWNAT_QUEUE_MAPPING_MAGIC_MASK) == HWNAT_QUEUE_MAPPING_MAGIC) {
-			_I = (skb->queue_mapping & HWNAT_QUEUE_MAPPING_HASH_MASK) % (NATFLOW_FASTNAT_TABLE_SIZE * 2);
-			nfn = &natflow_fast_nat_table[_I];
-			_I = (u32)ulongmindiff(jiffies, nfn->jiffies);
-
-			if (nfn->outdev && _I <= NATFLOW_FF_TIMEOUT_LOW && nfn->magic == natflow_path_magic) {
-				//nfn->jiffies = jiffies; /* we update jiffies in keepalive */
-				__vlan_hwaccel_clear_tag(skb);
-				skb_push(skb, (void *)ip_hdr(skb) - (void *)eth_hdr(skb));
-				skb->dev = nfn->outdev;
-				skb->queue_mapping = 0;
-				dev_queue_xmit(skb);
-				return NF_STOLEN;
-			}
-			/* Strict conditions can determine that it is a specially marked skb
-			 * so it is safe to drop
-			 * TODO: del foe
-			 */
-			return NF_DROP;
-		}
-#endif
-
 		if (skb_vlan_tag_present(skb)) {
 			goto out;
 		}
@@ -455,7 +454,7 @@ static unsigned int natflow_path_pre_ct_in_hook(void *priv,
 			        nfn->source == TCPH(l4)->source && nfn->dest == TCPH(l4)->dest &&
 			        nfn->protonum == IPPROTO_TCP) {
 				if (_I > NATFLOW_FF_TIMEOUT_LOW) {
-					re_learn = 1;
+					re_learn = 2;
 					goto slow_fastpath;
 				}
 				nfn->jiffies = jiffies;
@@ -476,12 +475,13 @@ static unsigned int natflow_path_pre_ct_in_hook(void *priv,
 					goto out;
 				}
 
-//#ifdef CONFIG_NET_RALINK_OFFLOAD
-#if 0
+#if defined(CONFIG_NET_RALINK_OFFLOAD) || defined(CONFIG_NET_MEDIATEK_SOC)
 				if ((nfn->flags & FASTNAT_EXT_HWNAT_FLAG)) {
 					__vlan_hwaccel_clear_tag(skb);
 					skb_push(skb, (void *)ip_hdr(skb) - (void *)eth_hdr(skb));
-					skb->dev = nfn->outdev;
+					skb->dev = get_vlan_real_dev(nfn->outdev);
+					skb->vlan_tci = HWNAT_QUEUE_MAPPING_MAGIC;
+					skb->hash = HWNAT_QUEUE_MAPPING_MAGIC;
 					dev_queue_xmit(skb);
 					/*FIXME what if gso? */
 					return NF_STOLEN;
@@ -588,7 +588,7 @@ fast_output:
 			        nfn->source == UDPH(l4)->source && nfn->dest == UDPH(l4)->dest &&
 			        nfn->protonum == IPPROTO_UDP) {
 				if (_I > NATFLOW_FF_TIMEOUT_LOW) {
-					re_learn = 1;
+					re_learn = 2;
 					goto slow_fastpath;
 				}
 				nfn->jiffies = jiffies;
@@ -606,12 +606,13 @@ fast_output:
 					goto out;
 				}
 
-//#ifdef CONFIG_NET_RALINK_OFFLOAD
-#if 0
+#if defined(CONFIG_NET_RALINK_OFFLOAD) || defined(CONFIG_NET_MEDIATEK_SOC)
 				if ((nfn->flags & FASTNAT_EXT_HWNAT_FLAG)) {
 					__vlan_hwaccel_clear_tag(skb);
 					skb_push(skb, (void *)ip_hdr(skb) - (void *)eth_hdr(skb));
-					skb->dev = nfn->outdev;
+					skb->dev = get_vlan_real_dev(nfn->outdev);
+					skb->vlan_tci = HWNAT_QUEUE_MAPPING_MAGIC;
+					skb->hash = HWNAT_QUEUE_MAPPING_MAGIC;
 					dev_queue_xmit(skb);
 					/*FIXME what if gso? */
 					return NF_STOLEN;
@@ -688,10 +689,12 @@ slow_fastpath:
 			simple_clear_bit(NF_FF_REPLY_CHECK_BIT, &nf->status);
 			simple_clear_bit(NF_FF_REPLY_OK_BIT, &nf->status);
 			simple_clear_bit(NF_FF_REPLY_BIT, &nf->status);
+			if (re_learn == 2) simple_clear_bit(NF_FF_ORIGINAL_CHECK_BIT, &nf->status);
 		} else {
 			simple_clear_bit(NF_FF_ORIGINAL_CHECK_BIT, &nf->status);
 			simple_clear_bit(NF_FF_ORIGINAL_OK_BIT, &nf->status);
 			simple_clear_bit(NF_FF_ORIGINAL_BIT, &nf->status);
+			if (re_learn == 2) simple_clear_bit(NF_FF_REPLY_CHECK_BIT, &nf->status);
 		}
 	}
 #endif
@@ -724,12 +727,12 @@ slow_fastpath:
 		struct nf_conn_counter *counter = acct->counter;
 		int packets = atomic64_read(&counter[0].packets) + atomic64_read(&counter[1].packets);
 		/* do FF check every 1024 packets */
-		if (packets % 1024 == 0) {
+		if (packets % 1024 == 1) {
 			simple_clear_bit(NF_FF_ORIGINAL_CHECK_BIT, &nf->status);
 			simple_clear_bit(NF_FF_REPLY_CHECK_BIT, &nf->status);
 		}
 		/* skip 1/64 packets to slow path */
-		if (packets % 64 == 0) {
+		if (packets % 64 == 63) {
 			goto out;
 		}
 	}
@@ -804,13 +807,15 @@ fastnat_check:
 						natflow_fastnat_node_t *nfn = &natflow_fast_nat_table[hash];
 						struct ethhdr *eth = (struct ethhdr *)nf->rroute[d].l2_head;
 
-						if (ulongmindiff(jiffies, nfn->jiffies) < NATFLOW_FF_TIMEOUT_HIGH &&
-						        (nfn->saddr != saddr || nfn->daddr != daddr || nfn->source != source || nfn->dest != dest || nfn->protonum != protonum)) {
+						if (natflow_hash_skip(hash) ||
+						        (ulongmindiff(jiffies, nfn->jiffies) < NATFLOW_FF_TIMEOUT_HIGH &&
+						         (nfn->saddr != saddr || nfn->daddr != daddr || nfn->source != source || nfn->dest != dest || nfn->protonum != protonum))) {
 							hash += 1;
 							nfn = &natflow_fast_nat_table[hash];
 						}
-						if (ulongmindiff(jiffies, nfn->jiffies) > NATFLOW_FF_TIMEOUT_HIGH ||
-						        (nfn->saddr == saddr && nfn->daddr == daddr && nfn->source == source && nfn->dest == dest && nfn->protonum == protonum)) {
+						if (!natflow_hash_skip(hash) &&
+						        (ulongmindiff(jiffies, nfn->jiffies) > NATFLOW_FF_TIMEOUT_HIGH ||
+						         (nfn->saddr == saddr && nfn->daddr == daddr && nfn->source == source && nfn->dest == dest && nfn->protonum == protonum))) {
 							switch (iph->protocol) {
 							case IPPROTO_TCP:
 								NATFLOW_INFO("(PCO)" DEBUG_TCP_FMT ": dir=%d use hash=%d\n", DEBUG_TCP_ARG(iph,l4), d, hash);
@@ -902,11 +907,12 @@ fastnat_check:
 									}
 									nfn->ifindex = (u16)nfn_i->outdev->ifindex;
 									nfn_i->ifindex = (u16)nfn->outdev->ifindex;
+									nfn_i->jiffies = jiffies;
 									if (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.protonum == IPPROTO_TCP) {
 										ct->proto.tcp.seen[0].flags |= IP_CT_TCP_FLAG_BE_LIBERAL;
 										ct->proto.tcp.seen[1].flags |= IP_CT_TCP_FLAG_BE_LIBERAL;
 									}
-#ifdef CONFIG_NET_RALINK_OFFLOAD
+#if defined(CONFIG_NET_RALINK_OFFLOAD) || defined(CONFIG_NET_MEDIATEK_SOC)
 									if (hwnat) {
 										if (!(nfn->flags & FASTNAT_NO_ARP) && !(nfn_i->flags & FASTNAT_NO_ARP) &&
 										        !netif_is_bridge_master(nfn->outdev) && !netif_is_bridge_master(nfn_i->outdev)) {
@@ -937,10 +943,6 @@ fastnat_check:
 													reply_dev = reply.dev;
 													reply_dsa_port = reply.dsa_port;
 												}
-											}
-											if (!((orig_dsa_port == 0xffff && reply_dsa_port == 0xffff) ||
-											        (orig_dsa_port != 0xffff && reply_dsa_port != 0xffff))) {
-												goto skip_hwnat;
 											}
 											if (orig_dev->netdev_ops->ndo_flow_offload) {
 												if (orig_dev == reply_dev) {
@@ -978,7 +980,7 @@ fastnat_check:
 														reply.pppoe_sid = ntohs(PPPOEH(nf->rroute[NF_FF_DIR_REPLY].l2_head + ETH_HLEN)->sid);
 													}
 													if (orig_dev->netdev_ops->ndo_flow_offload(FLOW_OFFLOAD_ADD, &natflow->flow, &reply, &orig) == 0) {
-														NATFLOW_INFO("(PCO) set hwnat offload dev=%s s=%pI4:%u d=%pI4:%u dev=%s s=%pI4:%u d=%pI4:%u\n",
+														NATFLOW_INFO("(PCO) set hwnat offload 1 dev=%s s=%pI4:%u d=%pI4:%u dev=%s s=%pI4:%u d=%pI4:%u\n",
 														             nfn->outdev->name, &nfn->saddr, ntohs(nfn->source), &nfn->daddr, ntohs(nfn->dest),
 														             nfn_i->outdev->name, &nfn_i->saddr, ntohs(nfn_i->source), &nfn_i->daddr, ntohs(nfn_i->dest));
 													} else {
@@ -986,10 +988,10 @@ fastnat_check:
 														simple_set_bit(NF_FF_FAIL_BIT, &nf->status);
 														switch (iph->protocol) {
 														case IPPROTO_TCP:
-															NATFLOW_INFO("(PCO)" DEBUG_TCP_FMT ": dir=%d set hwnat offload fail\n", DEBUG_TCP_ARG(iph,l4), d);
+															NATFLOW_INFO("(PCO)" DEBUG_TCP_FMT ": dir=%d set hwnat offload fail1\n", DEBUG_TCP_ARG(iph,l4), d);
 															break;
 														case IPPROTO_UDP:
-															NATFLOW_INFO("(PCO)" DEBUG_UDP_FMT ": dir=%d set hwnat offload fail\n", DEBUG_UDP_ARG(iph,l4), d);
+															NATFLOW_INFO("(PCO)" DEBUG_UDP_FMT ": dir=%d set hwnat offload fail1\n", DEBUG_UDP_ARG(iph,l4), d);
 															break;
 														}
 													}
@@ -999,10 +1001,12 @@ fastnat_check:
 													struct flow_offload_hw_path orig = {
 														.dev = orig_dev,
 														.flags = FLOW_OFFLOAD_PATH_ETHERNET,
+														.dsa_port = orig_dsa_port,
 													};
 													struct flow_offload_hw_path reply = {
-														.dev = nf->rroute[NF_FF_DIR_REPLY].outdev,
+														.dev = reply_dev,
 														.flags = FLOW_OFFLOAD_PATH_ETHERNET,
+														.dsa_port = reply_dsa_port,
 													};
 													/* no vlan for ext dev */
 													reply_dev = nf->rroute[NF_FF_DIR_REPLY].outdev;
@@ -1029,7 +1033,7 @@ fastnat_check:
 														reply.pppoe_sid = ntohs(PPPOEH(nf->rroute[NF_FF_DIR_REPLY].l2_head + ETH_HLEN)->sid);
 													}
 													if (orig_dev->netdev_ops->ndo_flow_offload(FLOW_OFFLOAD_ADD, &natflow->flow, &reply, &orig) == 0) {
-														NATFLOW_INFO("(PCO) set hwnat offload dev=%s s=%pI4:%u d=%pI4:%u dev=%s s=%pI4:%u d=%pI4:%u\n",
+														NATFLOW_INFO("(PCO) set hwnat offload 2 dev=%s s=%pI4:%u d=%pI4:%u dev=%s s=%pI4:%u d=%pI4:%u\n",
 														             nfn->outdev->name, &nfn->saddr, ntohs(nfn->source), &nfn->daddr, ntohs(nfn->dest),
 														             nfn_i->outdev->name, &nfn_i->saddr, ntohs(nfn_i->source), &nfn_i->daddr, ntohs(nfn_i->dest));
 														if (nf->rroute[NF_FF_DIR_REPLY].outdev == nfn->outdev) {
@@ -1042,10 +1046,10 @@ fastnat_check:
 														simple_set_bit(NF_FF_FAIL_BIT, &nf->status);
 														switch (iph->protocol) {
 														case IPPROTO_TCP:
-															NATFLOW_INFO("(PCO)" DEBUG_TCP_FMT ": dir=%d set hwnat offload fail\n", DEBUG_TCP_ARG(iph,l4), d);
+															NATFLOW_INFO("(PCO)" DEBUG_TCP_FMT ": dir=%d set hwnat offload fail2\n", DEBUG_TCP_ARG(iph,l4), d);
 															break;
 														case IPPROTO_UDP:
-															NATFLOW_INFO("(PCO)" DEBUG_UDP_FMT ": dir=%d set hwnat offload fail\n", DEBUG_UDP_ARG(iph,l4), d);
+															NATFLOW_INFO("(PCO)" DEBUG_UDP_FMT ": dir=%d set hwnat offload fail2\n", DEBUG_UDP_ARG(iph,l4), d);
 															break;
 														}
 													}
@@ -1058,12 +1062,14 @@ fastnat_check:
 													//orig_dev is ext dev
 													struct natflow_offload *natflow = natflow_offload_alloc(ct, nf);
 													struct flow_offload_hw_path orig = {
-														.dev = nf->rroute[NF_FF_DIR_ORIGINAL].outdev,
+														.dev = orig_dev,
 														.flags = FLOW_OFFLOAD_PATH_ETHERNET,
+														.dsa_port = orig_dsa_port,
 													};
 													struct flow_offload_hw_path reply = {
 														.dev = reply_dev,
 														.flags = FLOW_OFFLOAD_PATH_ETHERNET,
+														.dsa_port = reply_dsa_port,
 													};
 													/* no vlan for ext dev */
 													orig_dev = nf->rroute[NF_FF_DIR_ORIGINAL].outdev;
@@ -1090,7 +1096,7 @@ fastnat_check:
 														reply.pppoe_sid = ntohs(PPPOEH(nf->rroute[NF_FF_DIR_REPLY].l2_head + ETH_HLEN)->sid);
 													}
 													if (reply_dev->netdev_ops->ndo_flow_offload(FLOW_OFFLOAD_ADD, &natflow->flow, &reply, &orig) == 0) {
-														NATFLOW_INFO("(PCO) set hwnat offload dev=%s s=%pI4:%u d=%pI4:%u dev=%s s=%pI4:%u d=%pI4:%u\n",
+														NATFLOW_INFO("(PCO) set hwnat offload 3 dev=%s s=%pI4:%u d=%pI4:%u dev=%s s=%pI4:%u d=%pI4:%u\n",
 														             nfn->outdev->name, &nfn->saddr, ntohs(nfn->source), &nfn->daddr, ntohs(nfn->dest),
 														             nfn_i->outdev->name, &nfn_i->saddr, ntohs(nfn_i->source), &nfn_i->daddr, ntohs(nfn_i->dest));
 														if (nf->rroute[NF_FF_DIR_ORIGINAL].outdev == nfn->outdev) {
@@ -1103,10 +1109,10 @@ fastnat_check:
 														simple_set_bit(NF_FF_FAIL_BIT, &nf->status);
 														switch (iph->protocol) {
 														case IPPROTO_TCP:
-															NATFLOW_INFO("(PCO)" DEBUG_TCP_FMT ": dir=%d set hwnat offload fail\n", DEBUG_TCP_ARG(iph,l4), d);
+															NATFLOW_INFO("(PCO)" DEBUG_TCP_FMT ": dir=%d set hwnat offload fail3\n", DEBUG_TCP_ARG(iph,l4), d);
 															break;
 														case IPPROTO_UDP:
-															NATFLOW_INFO("(PCO)" DEBUG_UDP_FMT ": dir=%d set hwnat offload fail\n", DEBUG_UDP_ARG(iph,l4), d);
+															NATFLOW_INFO("(PCO)" DEBUG_UDP_FMT ": dir=%d set hwnat offload fail3\n", DEBUG_UDP_ARG(iph,l4), d);
 															break;
 														}
 													}
@@ -1115,8 +1121,6 @@ fastnat_check:
 										}
 									} else {
 										/* hwnat */
-skip_hwnat:
-										;
 									}
 #endif
 								} else {
